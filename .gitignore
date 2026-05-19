@@ -1,0 +1,19 @@
+# Rust — artefacts de compilation
+/target/
+**/*.rs.bk
+
+# Secrets — NE JAMAIS committer
+.env
+.env.*
+!.env.example
+
+# Données enregistrées par les outils de recon
+/data/
+ticks_*.csv
+
+# OS / éditeur
+.DS_Store
+*.swp
+
+# Claude Code — config locale (non partagée)
+.claude/settings.local.json
