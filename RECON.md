@@ -41,7 +41,7 @@ hypothèse — pas une décision d'architecture.
   - Réponse : `[À MESURER]` — possible sur les 2 venues grâce aux timestamps serveur ci-dessus.
 - [ ] WS = snapshot initial + deltas, ou snapshots complets ? Y a-t-il des numéros de séquence ?
   - Réponse Lighter : `[CONNU]` snapshot complet au `subscribe`, puis deltas (~50 ms). Séquence via `nonce` / `begin_nonce` ; continuité = `begin_nonce` courant == `nonce` précédent. `offset` peut sauter en cas de reconnexion sur un autre serveur.
-  - Réponse Hyperliquid : `[À MESURER]` — `l2Book` snapshot ou delta ? présence d'un numéro de séquence ?
+  - Réponse Hyperliquid : `[CONFIRMÉ par le SDK officiel]` — `l2Book` envoie un snapshot complet à chaque message (struct `L2BookData`), sans numéro de séquence.
 - [ ] Combien de niveaux de carnet chaque WS expose-t-il ? Assez pour le VWAP à taille max ?
   - Réponse Lighter : `[À MESURER]` — profondeur de l'`order_book` à confirmer.
   - Réponse Hyperliquid : `[À MESURER]` — profondeur du `l2Book` à confirmer (le canal `bbo` ne donne qu'1 niveau).
@@ -121,6 +121,11 @@ hypothèse — pas une décision d'architecture.
 - Souscription BBO : `{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}`
 - Souscription L2 : `{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}`
 - Format niveau (bbo et l2Book) : `{"px":"...","sz":"...","n":<nb ordres>}`
+- `l2Book` (confirmé contre `hyperliquid-rust-sdk`) : `data = {coin, time, levels}` où
+  `levels` est un tableau de 2 listes `[bids, asks]` ; snapshot complet à chaque
+  message, sans numéro de séquence.
 - Message : `{"channel":"...","data":{"coin":"...","time":<ms>,...}}`
 - Ping : `{"method":"ping"}` → canal `pong`. Message de bienvenue en texte clair.
+- Reconnexion : le SDK officiel utilise un délai plat de 1 s (sans backoff) et
+  n'a pas de timeout de lecture.
 - Signature/placement d'ordre HL : non encore étudiés (EIP-712/secp256k1 — phase bot).

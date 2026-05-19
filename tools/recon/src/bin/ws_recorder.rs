@@ -13,9 +13,9 @@
 //!
 //! Sortie : data/ticks_YYYYMMDD_HHMMSS.jsonl
 //!
-//! NOTE recon : le format exact du canal `l2Book` d'Hyperliquid (snapshot vs
-//! delta, profondeur) est précisément un point à confirmer — le recorder logge
-//! les premiers messages non reconnus pour faciliter le diagnostic.
+//! Format Hyperliquid `l2Book` confirmé contre le SDK officiel
+//! (`hyperliquid-rust-sdk`) : snapshot complet à chaque message, sans numéro
+//! de séquence.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -46,10 +46,15 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Intervalle entre deux pings applicatifs.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-/// Délai avant reconnexion après une coupure.
-const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Échelle entière utilisée comme clé du carnet Lighter (prix * 1e6).
 const PRICE_SCALE: f64 = 1_000_000.0;
+
+/// Reconnexion : délai de base, plafond, et durée de vie minimale d'une
+/// connexion au-delà de laquelle on la considère « saine » et on réinitialise
+/// le backoff.
+const BACKOFF_BASE: Duration = Duration::from_secs(2);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 
 // ============================ Helpers =======================================
 
@@ -69,6 +74,11 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         t
     }
+}
+
+/// Double le délai de reconnexion en le plafonnant à [`BACKOFF_MAX`].
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(BACKOFF_MAX)
 }
 
 // ============================ Arguments =====================================
@@ -282,14 +292,20 @@ async fn lighter_reader(
         return;
     }
     let mut unparsed_logged = 0u32;
+    let mut backoff = BACKOFF_BASE;
 
     while !cancel.load(Ordering::Relaxed) {
         eprintln!("[lighter] connexion à {LIGHTER_WS_URL}");
+        let connected_at = Instant::now();
         let ws = match connect_async(LIGHTER_WS_URL).await {
             Ok((ws, _)) => ws,
             Err(e) => {
-                eprintln!("[lighter] connexion échouée: {e}, nouvelle tentative dans 3s");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                eprintln!(
+                    "[lighter] connexion échouée: {e}, nouvelle tentative dans {}s",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = next_backoff(backoff);
                 continue;
             }
         };
@@ -389,8 +405,14 @@ async fn lighter_reader(
 
             let is_snapshot = msg_type == "subscribed/order_book";
             if !is_snapshot && msg_type != "update/order_book" {
-                if unparsed_logged < 3 {
-                    eprintln!("[lighter] message non reconnu: {}", truncate(&text, 200));
+                // Les erreurs venue sont toujours signalées, jamais supprimées.
+                if msg_type.contains("error") || text.contains("\"error\"") {
+                    eprintln!("[lighter] ERREUR serveur: {}", truncate(&text, 300));
+                } else if unparsed_logged < 3 {
+                    eprintln!(
+                        "[lighter] message non reconnu (type='{msg_type}'): {}",
+                        truncate(&text, 200)
+                    );
                     unparsed_logged += 1;
                 }
                 continue;
@@ -415,6 +437,15 @@ async fn lighter_reader(
             }
 
             if let Some(ob) = val.get("order_book") {
+                // Un code non nul signale une erreur côté carnet.
+                if let Some(code) = ob["code"].as_i64() {
+                    if code != 0 {
+                        eprintln!(
+                            "[lighter] order_book code d'erreur {code}: {}",
+                            truncate(&text, 200)
+                        );
+                    }
+                }
                 apply_lighter_delta(&mut book.bids, &ob["bids"]);
                 apply_lighter_delta(&mut book.asks, &ob["asks"]);
                 let (bids, asks) = lighter_top_levels(book, depth);
@@ -443,8 +474,16 @@ async fn lighter_reader(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        eprintln!("[lighter] déconnecté, reconnexion dans 2s");
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        // Connexion saine assez longtemps → on repart d'un backoff minimal.
+        if connected_at.elapsed() >= BACKOFF_RESET_AFTER {
+            backoff = BACKOFF_BASE;
+        }
+        eprintln!(
+            "[lighter] déconnecté, reconnexion dans {}s",
+            backoff.as_secs()
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = next_backoff(backoff);
     }
     eprintln!("[lighter] reader arrêté");
 }
@@ -480,14 +519,20 @@ async fn hyperliquid_reader(
         return;
     }
     let mut unparsed_logged = 0u32;
+    let mut backoff = BACKOFF_BASE;
 
     while !cancel.load(Ordering::Relaxed) {
         eprintln!("[hyperliquid] connexion à {HYPERLIQUID_WS_URL}");
+        let connected_at = Instant::now();
         let ws = match connect_async(HYPERLIQUID_WS_URL).await {
             Ok((ws, _)) => ws,
             Err(e) => {
-                eprintln!("[hyperliquid] connexion échouée: {e}, nouvelle tentative dans 3s");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                eprintln!(
+                    "[hyperliquid] connexion échouée: {e}, nouvelle tentative dans {}s",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = next_backoff(backoff);
                 continue;
             }
         };
@@ -571,8 +616,15 @@ async fn hyperliquid_reader(
                 continue;
             }
             if channel != "l2Book" {
-                if unparsed_logged < 3 {
-                    eprintln!("[hyperliquid] message non reconnu: {}", truncate(&text, 200));
+                // Hyperliquid signale les souscriptions rejetées via un canal d'erreur :
+                // ces messages sont toujours signalés, jamais supprimés.
+                if channel.eq_ignore_ascii_case("error") || text.contains("error") {
+                    eprintln!("[hyperliquid] ERREUR serveur: {}", truncate(&text, 300));
+                } else if unparsed_logged < 3 {
+                    eprintln!(
+                        "[hyperliquid] message non reconnu (channel='{channel}'): {}",
+                        truncate(&text, 200)
+                    );
                     unparsed_logged += 1;
                 }
                 continue;
@@ -618,8 +670,16 @@ async fn hyperliquid_reader(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        eprintln!("[hyperliquid] déconnecté, reconnexion dans 2s");
-        tokio::time::sleep(RECONNECT_DELAY).await;
+        // Connexion saine assez longtemps → on repart d'un backoff minimal.
+        if connected_at.elapsed() >= BACKOFF_RESET_AFTER {
+            backoff = BACKOFF_BASE;
+        }
+        eprintln!(
+            "[hyperliquid] déconnecté, reconnexion dans {}s",
+            backoff.as_secs()
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = next_backoff(backoff);
     }
     eprintln!("[hyperliquid] reader arrêté");
 }
