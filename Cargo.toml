@@ -1,9 +1,10 @@
 # Workspace BBOT — le "chef d'orchestre" qui regroupe toutes les briques.
-# On ajoutera des membres (tools/recon, etc.) au fur et à mesure.
+# On ajoutera des membres au fur et à mesure.
 [workspace]
 resolver = "2"
 members = [
     "crates/exchanges",
+    "tools/recon",
 ]
 
 [workspace.package]
